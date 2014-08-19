@@ -1,0 +1,284 @@
+---
+title: "Sharpe lab - Tcell RNASeq"
+output:
+  html_document:
+    theme: cosmo
+    toc: true
+    toc_depth: 4
+    fig_caption: true
+    fig_width: 8
+    fig_height: 6
+author: "Meeta Mistry"
+---
+
+```{r setup, echo=FALSE}
+ 
+# Setup report details
+clientname="Pete Sage"
+clientemail="peter_sage@hms.harvard.edu"
+lablocation="Sharpe Lab- HMS"
+analystname="Meeta Mistry"
+analystemail="mmistry@hsph.harvard.edu"
+```
+
+
+RNA-Seq analysis for `r clientname` (`r clientemail`) at `r lablocation`. Contact `r analystname` (`r analystemail`) for additional details. Request from client was:     
+
+To look at TFRs and their effect on TFH cells and the downstream B cells. What is the transcriptional difference between the two cells under suppression from TFR?                                                  
+
+  * Group 1: B cells stimulated (quadruplicate) 
+  * Group 2: B cells suppressed by Tfr (quadruplicate)
+  * Group 3: Tfh cells stimulated (quadruplicate)
+  * Group 4: Tfh cells suppressed by Tfr (quadruplicate)
+
+## Workflow:   
+  * run fastq files through [bcbio](https://bcbio-nextgen.readthedocs.org/en/latest/index.html) on Orchestra
+  * assess QC [report link](./qc-summary.html)
+  * expression validation of some known/control genes
+  * simple DEG list for the two B cell populations and the two T cell populations
+
+
+## Setup
+### Bioconductor and R libraries used
+
+```{r libraries, echo=TRUE}
+loadlibs <- function(){
+library(ggplot2)
+library(reshape)
+library(gplots)
+library(RColorBrewer)
+library(CHBUtils)
+library(ggdendro)
+library(grid)
+library(gridExtra)
+library(limma)
+library(DESeq2)
+library(Biobase)
+library(genefilter)
+library(splitstackshape)
+library(GOstats)
+library(png)
+}
+suppressPackageStartupMessages(loadlibs())
+```
+
+### Set variables
+```{r directories, echo=TRUE}
+baseDir=getwd()
+dataDir=paste(baseDir, "/data", sep="")
+resultsDir=paste(baseDir, "/results", sep="")
+metaDir=paste(dataDir, "/meta", sep="")
+
+heatcolors.1 <- rev(brewer.pal(6, "YlOrRd"))
+heatcolors.2 <- colorRampPalette(brewer.pal(9, "GnBu"))(100)
+cbPalette <- cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", 
+                            "#D55E00", "#CC79A7", "#000000")
+```
+
+## RNA-Seq
+### Load data
+
+```{r loadcounts}
+data <- read.delim(file.path(dataDir, 'combined.counts'), header=T, sep="\t", row.names=1, as.is=T) 
+meta <- read.delim(file.path(metaDir, 'project1.csv'), header=T, sep="\t", row.names=1)
+ord.names <- sapply(rownames(meta), function(x){grep(x, colnames(data))})
+
+# Reorder data to match meta
+seq.data <- data[,as.numeric(ord.names)]
+colnames(seq.data) <- meta$shortname
+seq.meta <- meta[,2:5]
+row.names(seq.meta) <- meta$shortname
+
+# Create eset object
+eset <- new("ExpressionSet", exprs=as.matrix(seq.data))
+pData(eset) <- seq.meta
+annot <- read.delim(file.path(dataDir, 'annotated_combined.counts'), sep="\t", header=T, row.names=1)
+fData(eset) <- data.frame(symbol=annot$symbol, row.names=row.names(annot), stringsAsFactors = FALSE)
+```
+
+### Quality control
+Samples tend to cluster by group to some extent, and at the same time we observe some expected biological variability.
+
+```{r qcseq, echo=FALSE, fig.align='center', fig.width=22, warning=FALSE, message=FALSE}
+# PCA plot of first and second PCs
+dge <- DGEList(counts=seq.data)
+dge <- calcNormFactors(dge)
+normalized_counts = cpm(dge, normalized.lib.sizes=TRUE)
+p1 <- mds(normalized_counts, condition=seq.meta$group_desc, k=length(colnames(data)) - 1)
+
+# Dendrogram
+  meta.x <- seq.meta
+  myDist <- dist(t(normalized_counts))
+  myTree <-hclust(myDist)
+  dhc <- as.dendrogram(myTree)
+  ddata <- dendro_data(dhc, type="rectangle")
+  ddata$labels <- merge(ddata$labels, meta.x, by.x="label", by.y="row.names")
+p2 <- ggplot(segment(ddata)) +
+    geom_segment(aes(x=x, y=y, xend=xend, yend=yend)) +
+    theme_dendro() +
+    geom_text(data=label(ddata), aes(x=x, y=y, label=label, color= label(ddata)[['group_desc']], 
+                                     hjust=-0.1), size=4) +
+    coord_flip() + scale_y_reverse(expand=c(0.2, 50)) +
+    theme(axis.text.x=element_blank(),
+          axis.text.y=element_blank(),
+          axis.title.x=element_blank(),
+          axis.title.y=element_blank(),
+          legend.title=element_blank())
+
+grid.arrange(p1, p2, ncol=2)
+```
+
+## Control genes
+The following are cell surface markers genes which should show a high degree of specifity by cell type (B cell versus T cell) as described in the table below. The stripcharts are used to illustrate the expression for each gene across the different groups.
+
+```{r markertable, results='asis', echo=FALSE, fig.align='center'}
+
+markers <- read.delim("additional files/control_genes", header=T, sep="\t")
+markers <- markers[order(markers$Celltype),]
+kable(markers, format='markdown', row.names=FALSE)
+```
+
+```{r markergenes, echo=FALSE, fig.align='center', fig.height=30, fig.width=20, warning=FALSE}
+
+color <- brewer.pal(n=6, name="Set3")
+exp <- cpm(exprs(eset))
+
+# stripchart
+# Set up a blank stripchart
+par(las=2, mfrow=c(6,2), mar=c(2,4,3,2), cex=1.5)
+plot.new()
+legend("topleft", inset=0, title="Group", legend=levels(pData(eset)$group_desc), fill=color, horiz=FALSE, cex=1.2)
+
+for (i in markers$Gene){
+    stripchart(
+  		exp[which(fData(eset)$symbol %in% i),] ~ eset$group_desc,
+			method="jitter", vertical=TRUE,
+			ylab="Expression (cpm)", col=NA,
+			xlim=c(0.25,nlevels(eset$group_desc)+0.75),
+			ylim=range(exp[which(fData(eset)$symbol %in% i),]),
+			main= i,
+      xaxt="n"
+		);
+		# Then draw points for each sample
+		for (n in 1:nlevels(eset$group_desc)) {
+			j <- which(eset$group_desc == levels(eset$group_desc)[n]);
+			stripchart(
+				exp[which(fData(eset)$symbol %in% i), j],
+				method="jitter", vertical=TRUE, add=TRUE, at=n,
+				pch=21, cex=1.5, bg=color[n]
+			);
+		}
+}
+
+```
+
+## Validation with cytokines and immunoglobulin isotypes
+After forming stable contacts with antigen-primed B cells, Tfh cells release cytokines to stimulate mature B cells into forming germinal centers and undergoing antibody class-switching. Thus, we expect to see cytokine expression in activated Tfh cells which should be reduced in Tfr supressed cells. In contrast we expect to observe expression of isotypes in activated B cells which also should be reduced in Tfr supressed cells. (Sample color bar corresponds to stripchart legend above)
+
+```{r cytokine-validate}
+
+# get expression data for genes
+cytokines <- read.delim("additional files/cytokines", header=F, sep="\t", as.is=T)
+isotypes <- read.delim("additional files/isotypes", header=F, sep="\t", as.is=T)
+glist <- c(cytokines[,1], isotypes[,1])
+select <- match(glist, fData(eset)$symbol)
+
+# Subset to only four groups
+sub.eset <- eset[,-(which(pData(eset)$group == "group5"))]
+pData(sub.eset) <- droplevels(pData(sub.eset)[order(pData(sub.eset)$group_desc),])
+exprs(sub.eset) <- exprs(sub.eset)[,row.names(pData(sub.eset))]
+
+# set colors and genes
+color <- color[-c(1,4)]
+
+# plot heatmap
+heatmap.2(exprs(sub.eset)[select,],scale="row", col=heatcolors.2, labRow=fData(sub.eset)$symbol[select], Colv=FALSE, Rowv=FALSE, 
+       ColSideColors= color[pData(sub.eset)$group_desc], trace="none", dendrogram="none")
+```
+
+
+## DESeq2: Evaluating the effect of Tfr supression on Tfh and Bcells
+```{r deseq2-setup, fig.width=20, warning=FALSE, message=FALSE}
+
+# Create DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(countData = exprs(sub.eset), colData = pData(sub.eset), design = ~ group_desc)
+dds <- DESeq(dds)
+
+# Matrix of pseudocounts for downstream visualization: two methods
+rld <- rlog(dds)
+
+# Extract data of specified contrasts for Bcell
+contrast <- list("group_descBstim", "group_descBsupp")
+resBcell <- results(dds, contrast=contrast)
+
+# Extract data of specified contrasts for Tfh
+contrast <- list("group_descTfh_stim", "group_descTfh_supp")
+resTfh <- results(dds, contrast=contrast)
+
+
+# Plot p-value distributions
+df <- data.frame(resBcell[4:39017,])
+p1 <- ggplot(df, aes(x=pvalue)) + geom_histogram(binwidth=.05) +
+      scale_x_continuous(limits=c(0,1)) +
+      ggtitle("B cell comparison") +
+    theme(legend.position = "none",
+        plot.title = element_text(size = rel(1.5)),
+        axis.title = element_text(size = rel(1.5)),
+        axis.text = element_text(size = rel(1.25))) 
+
+df <- data.frame(resTfh[4:39017,])
+p2 <- ggplot(df, aes(x=pvalue)) + geom_histogram(binwidth=.05) +
+      scale_x_continuous(limits=c(0,1)) +
+      ggtitle("Tfh cell comparison") +
+    theme(legend.position = "none",
+        plot.title = element_text(size = rel(1.5)),
+        axis.title = element_text(size = rel(1.5)),
+        axis.text = element_text(size = rel(1.25))) 
+
+grid.arrange(p1, p2, ncol=2)
+
+```
+
+## Significant genes
+Significant genes were identified from each comaprison using the threshold of padj < 0.05 and an absolute FC > 2. The following genes lists resulted and the overlap between the two are few. Gene lists are provided in the links below with Ensembl ID, Gene symbol and RPKM values in each sample.                            
+
+  * Group 1 vs Group 2: [Bcell comparison](./results/resultsBcell)  
+  * Group 3 vs Group 4: [Tcell comparison](./results/resultsTcell)
+```{r venn, fig.align='center'}
+# Get significant genes from each comparison
+resultsAll <- list(resBcell, resTfh)
+p.cutoff <- 0.05
+fc <- 2
+sigmat <- lapply(resultsAll, function(x){
+            getGenes <- data.frame(x[4:39017,])
+            getGenes <- getGenes[which(getGenes$baseMean > 0),]
+            gene.FDR <- row.names(getGenes)[which(abs(getGenes$log2FoldChange) > fc & getGenes$padj < p.cutoff)]
+            return(gene.FDR)})
+img <- readPNG("additional files/vennOverlap.png")
+grid.raster(img)
+
+```
+
+
+```{r, eval=FALSE, echo=FALSE}
+
+# get gene lists
+fpkm <- read.delim(file.path(dataDir, "combined.fpkm"), header=T, sep="\t", row.names=1)
+out <- fpkm[sigmat[[2]],]
+an.out <- match(sigmat[[2]], row.names(annot))
+out <- cbind(annot$symbol[an.out], out)
+
+project_summary = "./project-summary.csv"
+summarydata = read.table(project_summary, header=TRUE, sep="\t")
+rownames(summarydata) = summarydata$Name
+summarydata <- summarydata[row.names(meta),]
+summarydata <- droplevels(summarydata[which(summarydata$group != "group5"),])
+
+ggplot(summarydata, aes(x=Name, y=Mapped, fill=group_desc)) + 
+    geom_bar(stat="identity") +
+    scale_x_discrete(labels=meta$shortname) +
+    theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+    ylab("mapped reads") + xlab("")
+```
+
+
